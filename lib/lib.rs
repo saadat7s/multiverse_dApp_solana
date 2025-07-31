@@ -10,7 +10,7 @@ pub mod multiversed_dapp {
     use super::*;
 
     /// Initializes all necessary accounts before staking
-    pub fn initialize_accounts(ctx: Context<InitializeAccounts>) -> Result<()> {
+    pub fn initialize_staking_pool(ctx: Context<InitializeStakingPoolAccount>) -> Result<()> {
         let staking_pool = &mut ctx.accounts.staking_pool;
 
         if staking_pool.total_staked > 0 {
@@ -29,123 +29,61 @@ pub mod multiversed_dapp {
         Ok(())
     }
 
-    // Prize distribution function - matches the TypeScript service exactly
-    pub fn distribute_tournament_prizes(
-        ctx: Context<DistributeTournamentPrizes>,
-        tournament_id: String,
-    ) -> Result<()> {
-        // Fixed percentages for the top 3 positions
-        const PERCENTAGES: [u8; 3] = [50, 30, 20]; // 1st: 50%, 2nd: 30%, 3rd: 20%
-
-        // Convert tournament_id to fixed-size bytes for comparison
-        let mut tournament_id_bytes = [0u8; 32];
-        let id_bytes = tournament_id.as_bytes();
-        let len = id_bytes.len().min(32);
-        tournament_id_bytes[..len].copy_from_slice(&id_bytes[..len]);
-
-        // Verify tournament ID matches
-        require!(
-            ctx.accounts.prize_pool.tournament_id == tournament_id_bytes,
-            TournamentError::Unauthorized
-        );
-
-        // Ensure prize pool hasn't been distributed yet
-        require!(
-            !ctx.accounts.prize_pool.distributed,
-            TournamentError::AlreadyDistributed
-        );
-
-        // Ensure there are funds to distribute
-        require!(
-            ctx.accounts.prize_pool.total_funds > 0,
-            TournamentError::InsufficientFunds
-        );
-
-        let total_prize_funds = ctx.accounts.prize_pool.total_funds;
-        let decimals = ctx.accounts.mint.decimals;
-
-        // Calculate prize amounts for each position
-        let first_place_amount = (total_prize_funds as u128 * PERCENTAGES[0] as u128 / 100) as u64;
-        let second_place_amount = (total_prize_funds as u128 * PERCENTAGES[1] as u128 / 100) as u64;
-        let third_place_amount = (total_prize_funds as u128 * PERCENTAGES[2] as u128 / 100) as u64;
-
-        // Create signer seeds for prize pool PDA
-        let tournament_pool_key = ctx.accounts.tournament_pool.key();
-        let prize_pool_seeds = &[
-            b"prize_pool",
-            tournament_pool_key.as_ref(),
-            &[ctx.accounts.prize_pool.bump],
-        ];
-        let signer_seeds: &[&[&[u8]]] = &[prize_pool_seeds];
-
-        // Transfer prizes to winners
-        // 1st Place
-        if first_place_amount > 0 {
-            token_2022::transfer_checked(
-                CpiContext::new_with_signer(
-                    ctx.accounts.token_program.to_account_info(),
-                    TransferChecked {
-                        from: ctx.accounts.prize_escrow_account.to_account_info(),
-                        to: ctx.accounts.first_place_token_account.to_account_info(),
-                        mint: ctx.accounts.mint.to_account_info(),
-                        authority: ctx.accounts.prize_pool.to_account_info(),
-                    },
-                    signer_seeds,
-                ),
-                first_place_amount,
-                decimals,
-            )?;
+        // Modified instruction to initialize just the global revenue pool
+        pub fn initialize_revenue_pool(ctx: Context<InitializeRevenuePool>) -> Result<()> {
+            let revenue_pool = &mut ctx.accounts.revenue_pool;
+            let admin = &ctx.accounts.admin;
+    
+            // Initialize revenue pool
+            revenue_pool.admin = admin.key();
+            revenue_pool.mint = ctx.accounts.mint.key();
+            revenue_pool.total_funds = 0;
+            revenue_pool.last_distribution = Clock::get()?.unix_timestamp;
+            revenue_pool.bump = ctx.bumps.revenue_pool;
+    
+            msg!("✅ Revenue pool initialized for admin: {}", admin.key());
+            Ok(())
+        }
+    
+        // New instruction to initialize a prize pool for a specific tournament
+        pub fn initialize_prize_pool(
+            ctx: Context<InitializePrizePool>,
+            tournament_id: String,
+        ) -> Result<()> {
+            let prize_pool = &mut ctx.accounts.prize_pool;
+            let admin = &ctx.accounts.admin;
+            let tournament_pool = &ctx.accounts.tournament_pool;
+    
+            // Convert tournament_id to fixed-size bytes
+            let mut tournament_id_bytes = [0u8; 32]; // Increased from 10 to 32
+            let id_bytes = tournament_id.as_bytes();
+            let len = id_bytes.len().min(32);
+            tournament_id_bytes[..len].copy_from_slice(&id_bytes[..len]);
+    
+            // Verify that the tournament_id matches the one in the tournament pool
+            let tournament_pool_id = &tournament_pool.tournament_id;
+            require!(
+                &tournament_id_bytes[..] == tournament_pool_id.as_ref(),
+                TournamentError::Unauthorized
+            );
+    
+            // Initialize prize pool
+            prize_pool.admin = admin.key();
+            prize_pool.tournament_pool = tournament_pool.key();
+            prize_pool.mint = ctx.accounts.mint.key();
+            prize_pool.tournament_id = tournament_id_bytes;
+            prize_pool.total_funds = 0;
+            prize_pool.distributed = false;
+            prize_pool.bump = ctx.bumps.prize_pool;
+    
+            msg!(
+                "✅ Prize pool initialized for tournament: {}",
+                tournament_id
+            );
+            Ok(())
         }
 
-        // 2nd Place
-        if second_place_amount > 0 {
-            token_2022::transfer_checked(
-                CpiContext::new_with_signer(
-                    ctx.accounts.token_program.to_account_info(),
-                    TransferChecked {
-                        from: ctx.accounts.prize_escrow_account.to_account_info(),
-                        to: ctx.accounts.second_place_token_account.to_account_info(),
-                        mint: ctx.accounts.mint.to_account_info(),
-                        authority: ctx.accounts.prize_pool.to_account_info(),
-                    },
-                    signer_seeds,
-                ),
-                second_place_amount,
-                decimals,
-            )?;
-        }
 
-        // 3rd Place
-        if third_place_amount > 0 {
-            token_2022::transfer_checked(
-                CpiContext::new_with_signer(
-                    ctx.accounts.token_program.to_account_info(),
-                    TransferChecked {
-                        from: ctx.accounts.prize_escrow_account.to_account_info(),
-                        to: ctx.accounts.third_place_token_account.to_account_info(),
-                        mint: ctx.accounts.mint.to_account_info(),
-                        authority: ctx.accounts.prize_pool.to_account_info(),
-                    },
-                    signer_seeds,
-                ),
-                third_place_amount,
-                decimals,
-            )?;
-        }
-
-        // Mark prize pool as distributed
-        ctx.accounts.prize_pool.distributed = true;
-        ctx.accounts.prize_pool.total_funds = 0; // Reset funds after distribution
-
-        msg!(
-            "✅ Tournament prizes distributed: 1st: {}, 2nd: {}, 3rd: {}",
-            first_place_amount,
-            second_place_amount,
-            third_place_amount
-        );
-
-        Ok(())
-    }
 
     /// Allows a user to stake tokens
     pub fn stake(ctx: Context<Stake>, amount: u64, lock_duration: i64) -> Result<()> {
@@ -391,59 +329,7 @@ pub mod multiversed_dapp {
         Ok(())
     }
 
-    // Modified instruction to initialize just the global revenue pool
-    pub fn initialize_revenue_pool(ctx: Context<InitializeRevenuePool>) -> Result<()> {
-        let revenue_pool = &mut ctx.accounts.revenue_pool;
-        let admin = &ctx.accounts.admin;
 
-        // Initialize revenue pool
-        revenue_pool.admin = admin.key();
-        revenue_pool.mint = ctx.accounts.mint.key();
-        revenue_pool.total_funds = 0;
-        revenue_pool.last_distribution = Clock::get()?.unix_timestamp;
-        revenue_pool.bump = ctx.bumps.revenue_pool;
-
-        msg!("✅ Revenue pool initialized for admin: {}", admin.key());
-        Ok(())
-    }
-
-    // New instruction to initialize a prize pool for a specific tournament
-    pub fn initialize_prize_pool(
-        ctx: Context<InitializePrizePool>,
-        tournament_id: String,
-    ) -> Result<()> {
-        let prize_pool = &mut ctx.accounts.prize_pool;
-        let admin = &ctx.accounts.admin;
-        let tournament_pool = &ctx.accounts.tournament_pool;
-
-        // Convert tournament_id to fixed-size bytes
-        let mut tournament_id_bytes = [0u8; 32]; // Increased from 10 to 32
-        let id_bytes = tournament_id.as_bytes();
-        let len = id_bytes.len().min(32);
-        tournament_id_bytes[..len].copy_from_slice(&id_bytes[..len]);
-
-        // Verify that the tournament_id matches the one in the tournament pool
-        let tournament_pool_id = &tournament_pool.tournament_id;
-        require!(
-            &tournament_id_bytes[..] == tournament_pool_id.as_ref(),
-            TournamentError::Unauthorized
-        );
-
-        // Initialize prize pool
-        prize_pool.admin = admin.key();
-        prize_pool.tournament_pool = tournament_pool.key();
-        prize_pool.mint = ctx.accounts.mint.key();
-        prize_pool.tournament_id = tournament_id_bytes;
-        prize_pool.total_funds = 0;
-        prize_pool.distributed = false;
-        prize_pool.bump = ctx.bumps.prize_pool;
-
-        msg!(
-            "✅ Prize pool initialized for tournament: {}",
-            tournament_id
-        );
-        Ok(())
-    }
 
     // OPTIMIZED FUNCTION: Fixed stack overflow issues
     pub fn distribute_tournament_revenue(
@@ -583,7 +469,221 @@ pub mod multiversed_dapp {
         Ok(())
     }
 
+        // Prize distribution function - matches the TypeScript service exactly
+        pub fn distribute_tournament_prizes(
+            ctx: Context<DistributeTournamentPrizes>,
+            tournament_id: String,
+        ) -> Result<()> {
+            // Fixed percentages for the top 3 positions
+            const PERCENTAGES: [u8; 3] = [50, 30, 20]; // 1st: 50%, 2nd: 30%, 3rd: 20%
+    
+            // Convert tournament_id to fixed-size bytes for comparison
+            let mut tournament_id_bytes = [0u8; 32];
+            let id_bytes = tournament_id.as_bytes();
+            let len = id_bytes.len().min(32);
+            tournament_id_bytes[..len].copy_from_slice(&id_bytes[..len]);
+    
+            // Verify tournament ID matches
+            require!(
+                ctx.accounts.prize_pool.tournament_id == tournament_id_bytes,
+                TournamentError::Unauthorized
+            );
+    
+            // Ensure prize pool hasn't been distributed yet
+            require!(
+                !ctx.accounts.prize_pool.distributed,
+                TournamentError::AlreadyDistributed
+            );
+    
+            // Ensure there are funds to distribute
+            require!(
+                ctx.accounts.prize_pool.total_funds > 0,
+                TournamentError::InsufficientFunds
+            );
+    
+            let total_prize_funds = ctx.accounts.prize_pool.total_funds;
+            let decimals = ctx.accounts.mint.decimals;
+    
+            // Calculate prize amounts for each position
+            let first_place_amount = (total_prize_funds as u128 * PERCENTAGES[0] as u128 / 100) as u64;
+            let second_place_amount = (total_prize_funds as u128 * PERCENTAGES[1] as u128 / 100) as u64;
+            let third_place_amount = (total_prize_funds as u128 * PERCENTAGES[2] as u128 / 100) as u64;
+    
+            // Create signer seeds for prize pool PDA
+            let tournament_pool_key = ctx.accounts.tournament_pool.key();
+            let prize_pool_seeds = &[
+                b"prize_pool",
+                tournament_pool_key.as_ref(),
+                &[ctx.accounts.prize_pool.bump],
+            ];
+            let signer_seeds: &[&[&[u8]]] = &[prize_pool_seeds];
+    
+            // Transfer prizes to winners
+            // 1st Place
+            if first_place_amount > 0 {
+                token_2022::transfer_checked(
+                    CpiContext::new_with_signer(
+                        ctx.accounts.token_program.to_account_info(),
+                        TransferChecked {
+                            from: ctx.accounts.prize_escrow_account.to_account_info(),
+                            to: ctx.accounts.first_place_token_account.to_account_info(),
+                            mint: ctx.accounts.mint.to_account_info(),
+                            authority: ctx.accounts.prize_pool.to_account_info(),
+                        },
+                        signer_seeds,
+                    ),
+                    first_place_amount,
+                    decimals,
+                )?;
+            }
+    
+            // 2nd Place
+            if second_place_amount > 0 {
+                token_2022::transfer_checked(
+                    CpiContext::new_with_signer(
+                        ctx.accounts.token_program.to_account_info(),
+                        TransferChecked {
+                            from: ctx.accounts.prize_escrow_account.to_account_info(),
+                            to: ctx.accounts.second_place_token_account.to_account_info(),
+                            mint: ctx.accounts.mint.to_account_info(),
+                            authority: ctx.accounts.prize_pool.to_account_info(),
+                        },
+                        signer_seeds,
+                    ),
+                    second_place_amount,
+                    decimals,
+                )?;
+            }
+    
+            // 3rd Place
+            if third_place_amount > 0 {
+                token_2022::transfer_checked(
+                    CpiContext::new_with_signer(
+                        ctx.accounts.token_program.to_account_info(),
+                        TransferChecked {
+                            from: ctx.accounts.prize_escrow_account.to_account_info(),
+                            to: ctx.accounts.third_place_token_account.to_account_info(),
+                            mint: ctx.accounts.mint.to_account_info(),
+                            authority: ctx.accounts.prize_pool.to_account_info(),
+                        },
+                        signer_seeds,
+                    ),
+                    third_place_amount,
+                    decimals,
+                )?;
+            }
+    
+            // Mark prize pool as distributed
+            ctx.accounts.prize_pool.distributed = true;
+            ctx.accounts.prize_pool.total_funds = 0; // Reset funds after distribution
+    
+            msg!(
+                "✅ Tournament prizes distributed: 1st: {}, 2nd: {}, 3rd: {}",
+                first_place_amount,
+                second_place_amount,
+                third_place_amount
+            );
+    
+            Ok(())
+        }
+
     // Rest of the account structs and implementations remain the same...
+
+
+    #[derive(Accounts)]
+    pub struct InitializeStakingPoolAccount<'info> {
+        #[account(
+            init_if_needed,
+            payer = admin,
+            space = 8 + 32 + 32 + 8 + 8 + 8 + 8 + 1 + 8,
+            seeds = [b"staking_pool", admin.key().as_ref()],
+            bump
+        )]
+        pub staking_pool: Account<'info, StakingPool>,
+
+        #[account(
+            init_if_needed,
+            payer = admin,
+            token::mint = mint,
+            token::authority = staking_pool,
+            seeds = [b"escrow", staking_pool.key().as_ref()],
+            bump
+        )]
+        pub pool_escrow_account: InterfaceAccount<'info, TokenAccount>,
+
+        pub mint: InterfaceAccount<'info, Mint>,
+        #[account(mut)]
+        pub admin: Signer<'info>,
+        pub system_program: Program<'info, System>,
+        pub token_program: Program<'info, Token2022>,
+    }
+
+    #[derive(Accounts)]
+    pub struct InitializeRevenuePool<'info> {
+        #[account(
+            init,
+            payer = admin,
+            space = 8 + 32 + 32 + 8 + 8 + 1,
+            seeds = [b"revenue_pool", admin.key().as_ref()],
+            bump
+        )]
+        pub revenue_pool: Account<'info, RevenuePool>,
+
+        #[account(
+            init,
+            payer = admin,
+            token::mint = mint,
+            token::authority = revenue_pool,
+            seeds = [b"revenue_escrow", revenue_pool.key().as_ref()],
+            bump
+        )]
+        pub revenue_escrow_account: InterfaceAccount<'info, TokenAccount>,
+
+        pub mint: InterfaceAccount<'info, Mint>,
+        #[account(mut)]
+        pub admin: Signer<'info>,
+        pub system_program: Program<'info, System>,
+        pub token_program: Program<'info, Token2022>,
+    }
+
+    #[derive(Accounts)]
+    #[instruction(tournament_id: String)]
+    pub struct InitializePrizePool<'info> {
+        #[account(
+            init,
+            payer = admin,
+            space = 8 + 32 + 32 + 32 + 32 + 8 + 1 + 1, // Updated space calculation
+            seeds = [b"prize_pool", tournament_pool.key().as_ref()],
+            bump
+        )]
+        pub prize_pool: Account<'info, PrizePool>,
+
+        #[account(
+            mut,
+            seeds = [b"tournament_pool", tournament_pool.admin.as_ref(), tournament_id.as_bytes()],
+            bump = tournament_pool.bump,
+            constraint = tournament_pool.admin == admin.key() @ TournamentError::Unauthorized
+        )]
+        pub tournament_pool: Account<'info, TournamentPool>,
+
+        #[account(
+            init_if_needed,
+            payer = admin,
+            token::mint = mint,
+            token::authority = prize_pool,
+            seeds = [b"prize_escrow", prize_pool.key().as_ref()],
+            bump
+        )]
+        pub prize_escrow_account: InterfaceAccount<'info, TokenAccount>,
+
+        pub mint: InterfaceAccount<'info, Mint>,
+        #[account(mut)]
+        pub admin: Signer<'info>,
+        pub system_program: Program<'info, System>,
+        pub token_program: Program<'info, Token2022>,
+    }
+
+
     #[derive(Accounts)]
     #[instruction(tournament_id: String, entry_fee: u64, max_participants: u16, end_time: i64)]
     pub struct CreateTournamentPool<'info> {
@@ -694,72 +794,6 @@ pub mod multiversed_dapp {
         pub token_program: Program<'info, Token2022>,
         pub system_program: Program<'info, System>,
     }
-
-    #[derive(Accounts)]
-    pub struct InitializeRevenuePool<'info> {
-        #[account(
-            init,
-            payer = admin,
-            space = 8 + 32 + 32 + 8 + 8 + 1,
-            seeds = [b"revenue_pool", admin.key().as_ref()],
-            bump
-        )]
-        pub revenue_pool: Account<'info, RevenuePool>,
-
-        #[account(
-            init,
-            payer = admin,
-            token::mint = mint,
-            token::authority = revenue_pool,
-            seeds = [b"revenue_escrow", revenue_pool.key().as_ref()],
-            bump
-        )]
-        pub revenue_escrow_account: InterfaceAccount<'info, TokenAccount>,
-
-        pub mint: InterfaceAccount<'info, Mint>,
-        #[account(mut)]
-        pub admin: Signer<'info>,
-        pub system_program: Program<'info, System>,
-        pub token_program: Program<'info, Token2022>,
-    }
-
-    #[derive(Accounts)]
-    #[instruction(tournament_id: String)]
-    pub struct InitializePrizePool<'info> {
-        #[account(
-            init,
-            payer = admin,
-            space = 8 + 32 + 32 + 32 + 32 + 8 + 1 + 1, // Updated space calculation
-            seeds = [b"prize_pool", tournament_pool.key().as_ref()],
-            bump
-        )]
-        pub prize_pool: Account<'info, PrizePool>,
-
-        #[account(
-            mut,
-            seeds = [b"tournament_pool", tournament_pool.admin.as_ref(), tournament_id.as_bytes()],
-            bump = tournament_pool.bump,
-            constraint = tournament_pool.admin == admin.key() @ TournamentError::Unauthorized
-        )]
-        pub tournament_pool: Account<'info, TournamentPool>,
-
-        #[account(
-            init_if_needed,
-            payer = admin,
-            token::mint = mint,
-            token::authority = prize_pool,
-            seeds = [b"prize_escrow", prize_pool.key().as_ref()],
-            bump
-        )]
-        pub prize_escrow_account: InterfaceAccount<'info, TokenAccount>,
-
-        pub mint: InterfaceAccount<'info, Mint>,
-        #[account(mut)]
-        pub admin: Signer<'info>,
-        pub system_program: Program<'info, System>,
-        pub token_program: Program<'info, Token2022>,
-    }
-
     // CRITICAL FIX: Simplified DistributeTournamentRevenue struct to reduce stack usage
     #[derive(Accounts)]
     #[instruction(tournament_id: String, prize_percentage: u8, revenue_percentage: u8, staking_percentage: u8, burn_percentage: u8)]
@@ -815,33 +849,7 @@ pub mod multiversed_dapp {
         pub token_program: Program<'info, Token2022>,
     }
 
-    #[derive(Accounts)]
-    pub struct InitializeAccounts<'info> {
-        #[account(
-            init_if_needed,
-            payer = admin,
-            space = 8 + 32 + 32 + 8 + 1,
-            seeds = [b"staking_pool", admin.key().as_ref()],
-            bump
-        )]
-        pub staking_pool: Account<'info, StakingPool>,
 
-        #[account(
-            init_if_needed,
-            payer = admin,
-            token::mint = mint,
-            token::authority = staking_pool,
-            seeds = [b"escrow", staking_pool.key().as_ref()],
-            bump
-        )]
-        pub pool_escrow_account: InterfaceAccount<'info, TokenAccount>,
-
-        pub mint: InterfaceAccount<'info, Mint>,
-        #[account(mut)]
-        pub admin: Signer<'info>,
-        pub system_program: Program<'info, System>,
-        pub token_program: Program<'info, Token2022>,
-    }
 
     #[derive(Accounts)]
     pub struct Stake<'info> {
@@ -858,7 +866,7 @@ pub mod multiversed_dapp {
         #[account(
             init_if_needed,
             payer = user,
-            space = 8 + 32 + 8 + 8 + 8,
+            space = 8 + 32 + 8 + 8 + 8 + 8 + 8 + 1 + 1 + 8,
             seeds = [b"user_stake", user.key().as_ref()],
             bump
         )]
@@ -922,12 +930,19 @@ pub mod multiversed_dapp {
     const SIX_MONTHS: i64 = 6 * ONE_MONTH;
     const TWELVE_MONTHS: i64 = 12 * ONE_MONTH;
 
+    const APY: i8 = 0.05;
+    const MAX_STAKE: u64 = 0.25;
+
     #[account]
     pub struct StakingPool {
         pub admin: Pubkey,
         pub mint: Pubkey,
         pub total_staked: u64,
+        pub initial_revenue: u64,
+        pub incremented_revenue: u64,
+        pub total_revenue: u64,
         pub bump: u8,
+        pub max_stake: u64,
     }
 
     #[account]
@@ -936,6 +951,11 @@ pub mod multiversed_dapp {
         pub staked_amount: u64,
         pub stake_timestamp: i64,
         pub lock_duration: i64,
+        pub initial_reward: u64,
+        pub incremented_reward: u64,
+        pub initial_apy: i8,
+        pub incremented_apy: i8,
+        pub joined_at: i64,
     }
 
     #[account]
