@@ -4,10 +4,10 @@ package_manager = "yarn"
 resolution = true
 skip-lint = false
 [programs.devnet]
-multiverse_dapp = "GSV3Qje19X3NTxc5uxhKw28uoadpZED5Siqd4tGVZ7x4"
+multiverse_dapp = "7xDwUMmJTJfa1QQDmhWvEFWR7GQ28hqHeRPzdWY7nJTj"
 
 [programs.localnet]
-multiverse_dapp = "GSV3Qje19X3NTxc5uxhKw28uoadpZED5Siqd4tGVZ7x4"
+multiverse_dapp = "7xDwUMmJTJfa1QQDmhWvEFWR7GQ28hqHeRPzdWY7nJTj"
 
 [registry]
 url = "https://api.apr.dev"

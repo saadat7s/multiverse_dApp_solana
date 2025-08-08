@@ -3,7 +3,8 @@ use anchor_lang::prelude::*;
 use anchor_spl::token_2022::{self, Burn, Token2022, TransferChecked};
 use anchor_spl::token_interface::{Mint, TokenAccount};
 
-declare_id!("GSV3Qje19X3NTxc5uxhKw28uoadpZED5Siqd4tGVZ7x4");
+// Fix: Use a valid program ID instead of placeholder
+declare_id!("Hfw6gCTRhjJRAePXCG8LabbbcL4d97nKCdR7Zbse3KHu");
 
 #[program]
 pub mod multiversed_dapp {
@@ -20,6 +21,11 @@ pub mod multiversed_dapp {
         staking_pool.admin = ctx.accounts.admin.key();
         staking_pool.mint = ctx.accounts.mint.key();
         staking_pool.total_staked = 0;
+        staking_pool.total_weighted_stake = 0;           // NEW: Initialize weighted stake
+        staking_pool.current_event_id = 0;              // NEW: Initialize event ID
+        staking_pool.total_accumulated_revenue = 0;     // NEW: Initialize revenue tracking
+        staking_pool.last_distribution_timestamp = 0;   // NEW: Initialize timestamp
+        staking_pool.active_stakers_count = 0;          // NEW: Initialize staker count
         staking_pool.bump = ctx.bumps.staking_pool;
 
         msg!(
@@ -85,121 +91,196 @@ pub mod multiversed_dapp {
 
 
 
-    /// Allows a user to stake tokens
-    pub fn stake(ctx: Context<Stake>, amount: u64, lock_duration: i64) -> Result<()> {
-        let mint_decimals = ctx.accounts.mint.decimals;
-        let amount_in_base_units = amount
-            .checked_mul(10_u64.pow(mint_decimals as u32))
-            .ok_or(StakingError::MathOverflow)?;
-
-        require!(
-            lock_duration == ONE_MONTH
-                || lock_duration == THREE_MONTHS
-                || lock_duration == SIX_MONTHS
-                || lock_duration == TWELVE_MONTHS,
-            StakingError::InvalidLockDuration
-        );
-
-        // Transfer tokens to escrow
-        let cpi_accounts = TransferChecked {
-            from: ctx.accounts.user_token_account.to_account_info(),
-            to: ctx.accounts.pool_escrow_account.to_account_info(),
-            mint: ctx.accounts.mint.to_account_info(),
-            authority: ctx.accounts.user.to_account_info(),
-        };
-
-        token_2022::transfer_checked(
-            CpiContext::new(ctx.accounts.token_program.to_account_info(), cpi_accounts),
-            amount_in_base_units,
-            mint_decimals,
-        )?;
-
-        // Update user staking account
-        let user_staking_account = &mut ctx.accounts.user_staking_account;
-        let _current_timestamp = Clock::get()?.unix_timestamp;
-        user_staking_account.owner = ctx.accounts.user.key();
-        user_staking_account.staked_amount = user_staking_account
-            .staked_amount
-            .checked_add(amount_in_base_units)
-            .ok_or(StakingError::MathOverflow)?;
-
-        user_staking_account.stake_timestamp = _current_timestamp;
-        user_staking_account.lock_duration = lock_duration;
-
-        // Update total staked in pool
-        ctx.accounts.staking_pool.total_staked = ctx
-            .accounts
-            .staking_pool
-            .total_staked
-            .checked_add(amount_in_base_units)
-            .ok_or(StakingError::MathOverflow)?;
-
-        msg!(
-            "✅ {} tokens staked by user: {} for {} seconds",
-            amount,
-            ctx.accounts.user.key(),
-            lock_duration
-        );
-
-        Ok(())
-    }
-
-    /// Allows users to unstake all of their tokens at any time
-    pub fn unstake(ctx: Context<Unstake>) -> Result<()> {
-        let user_staking_account = &mut ctx.accounts.user_staking_account;
-
-        // Ensure the user has a staked balance
-        require!(
-            user_staking_account.staked_amount > 0,
-            StakingError::InsufficientStakedBalance
-        );
-
-        let mint_decimals = ctx.accounts.mint.decimals;
-        let amount_in_base_units = user_staking_account.staked_amount;
-
-        // Transfer all staked tokens from the escrow account to the user's token account
-        let staking_pool_seeds = &[
-            b"staking_pool",
-            ctx.accounts.staking_pool.admin.as_ref(),
-            &[ctx.accounts.staking_pool.bump],
-        ];
-        let signer_seeds: &[&[&[u8]]] = &[staking_pool_seeds];
-
-        let transfer_ctx = CpiContext::new_with_signer(
-            ctx.accounts.token_program.to_account_info(),
-            TransferChecked {
-                from: ctx.accounts.pool_escrow_account.to_account_info(),
-                to: ctx.accounts.user_token_account.to_account_info(),
+        /// NEW: Create a revenue distribution event
+        pub fn create_revenue_distribution_event(
+            ctx: Context<CreateRevenueDistributionEvent>,
+            revenue_amount: u64,
+        ) -> Result<()> {
+            let staking_pool = &mut ctx.accounts.staking_pool;
+            let revenue_event = &mut ctx.accounts.revenue_event;
+    
+            // Increment event ID for this new distribution
+            let event_id = staking_pool.increment_event_id();
+    
+            // Initialize the revenue distribution event
+            revenue_event.event_id = event_id;
+            revenue_event.revenue_amount = revenue_amount;
+            revenue_event.timestamp = Clock::get()?.unix_timestamp;
+            revenue_event.total_stakers_at_event = staking_pool.active_stakers_count;
+            revenue_event.total_staked_at_event = staking_pool.total_staked;
+            revenue_event.total_weighted_stake_at_event = staking_pool.total_weighted_stake;
+            revenue_event.participants = Vec::new(); // Will be populated by backend
+            revenue_event.is_distributed = false;
+            revenue_event.bump = ctx.bumps.revenue_event;
+    
+            // Update staking pool tracking
+            staking_pool.total_accumulated_revenue = staking_pool.total_accumulated_revenue
+                .checked_add(revenue_amount)
+                .ok_or(StakingError::MathOverflow)?;
+            staking_pool.last_distribution_timestamp = Clock::get()?.unix_timestamp;
+    
+            msg!(
+                "✅ Revenue distribution event {} created with {} tokens",
+                event_id,
+                revenue_amount
+            );
+    
+            Ok(())
+        }
+    
+        /// Allows a user to stake tokens - MODIFIED to include reward tracking
+        pub fn stake(ctx: Context<Stake>, amount: u64, lock_duration: i64) -> Result<()> {
+            let mint_decimals = ctx.accounts.mint.decimals;
+            let amount_in_base_units = amount
+                .checked_mul(10_u64.pow(mint_decimals as u32))
+                .ok_or(StakingError::MathOverflow)?;
+    
+            require!(
+                lock_duration == ONE_MONTH
+                    || lock_duration == THREE_MONTHS
+                    || lock_duration == SIX_MONTHS
+                    || lock_duration == TWELVE_MONTHS,
+                StakingError::InvalidLockDuration
+            );
+    
+            // Transfer tokens to escrow
+            let cpi_accounts = TransferChecked {
+                from: ctx.accounts.user_token_account.to_account_info(),
+                to: ctx.accounts.pool_escrow_account.to_account_info(),
                 mint: ctx.accounts.mint.to_account_info(),
-                authority: ctx.accounts.staking_pool.to_account_info(),
-            },
-            signer_seeds,
-        );
-
-        // Execute the transfer of tokens (entire staked amount)
-        token_2022::transfer_checked(transfer_ctx, amount_in_base_units, mint_decimals)?;
-
-        // Update the staking data
-        user_staking_account.staked_amount = user_staking_account
-            .staked_amount
-            .checked_sub(amount_in_base_units)
-            .ok_or(StakingError::MathOverflow)?;
-
-        ctx.accounts.staking_pool.total_staked = ctx
-            .accounts
-            .staking_pool
-            .total_staked
-            .checked_sub(amount_in_base_units)
-            .ok_or(StakingError::MathOverflow)?;
-
-        msg!(
-            "✅ User {} unstaked all tokens. Remaining: {}",
-            ctx.accounts.user.key(),
-            user_staking_account.staked_amount
-        );
-
-        Ok(())
-    }
+                authority: ctx.accounts.user.to_account_info(),
+            };
+    
+            token_2022::transfer_checked(
+                CpiContext::new(ctx.accounts.token_program.to_account_info(), cpi_accounts),
+                amount_in_base_units,
+                mint_decimals,
+            )?;
+    
+            // Update user staking account with NEW fields
+            let user_staking_account = &mut ctx.accounts.user_staking_account;
+            let current_timestamp = Clock::get()?.unix_timestamp;
+            let is_new_staker = user_staking_account.staked_amount == 0;
+    
+            user_staking_account.owner = ctx.accounts.user.key();
+            user_staking_account.staked_amount = user_staking_account
+                .staked_amount
+                .checked_add(amount_in_base_units)
+                .ok_or(StakingError::MathOverflow)?;
+    
+            user_staking_account.stake_timestamp = current_timestamp;
+            user_staking_account.lock_duration = lock_duration;
+            
+            // NEW: Set reward tracking fields
+            if is_new_staker {
+                user_staking_account.joined_at_event = ctx.accounts.staking_pool.current_event_id;
+                user_staking_account.accumulated_rewards = 0;
+            }
+            user_staking_account.last_reward_calculation = current_timestamp;
+            user_staking_account.multiplier = UserStakingAccount::get_multiplier_from_lock_duration(lock_duration);
+    
+            // Calculate weighted stake
+            let weighted_stake = user_staking_account.calculate_weighted_stake();
+    
+            // Update staking pool totals
+            let staking_pool = &mut ctx.accounts.staking_pool;
+            staking_pool.total_staked = staking_pool
+                .total_staked
+                .checked_add(amount_in_base_units)
+                .ok_or(StakingError::MathOverflow)?;
+    
+            // NEW: Update weighted stake total
+            staking_pool.total_weighted_stake = staking_pool
+                .total_weighted_stake
+                .checked_add(weighted_stake)
+                .ok_or(StakingError::MathOverflow)?;
+    
+            // NEW: Update active stakers count if this is a new staker
+            if is_new_staker {
+                staking_pool.active_stakers_count = staking_pool.active_stakers_count
+                    .checked_add(1)
+                    .ok_or(StakingError::MathOverflow)?;
+            }
+    
+            msg!(
+                "✅ {} tokens staked by user: {} for {} seconds (Multiplier: {}x, Weighted: {})",
+                amount,
+                ctx.accounts.user.key(),
+                lock_duration,
+                user_staking_account.get_multiplier_as_float(),
+                weighted_stake
+            );
+    
+            Ok(())
+        }
+    
+        /// Allows users to unstake all of their tokens at any time - MODIFIED for reward tracking
+        pub fn unstake(ctx: Context<Unstake>) -> Result<()> {
+            let user_staking_account = &mut ctx.accounts.user_staking_account;
+    
+            // Ensure the user has a staked balance
+            require!(
+                user_staking_account.staked_amount > 0,
+                StakingError::InsufficientStakedAmount
+            );
+    
+            let mint_decimals = ctx.accounts.mint.decimals;
+            let amount_in_base_units = user_staking_account.staked_amount;
+            let weighted_stake = user_staking_account.calculate_weighted_stake();
+    
+            // Transfer all staked tokens from the escrow account to the user's token account
+            let staking_pool_seeds = &[
+                b"staking_pool",
+                ctx.accounts.staking_pool.admin.as_ref(),
+                &[ctx.accounts.staking_pool.bump],
+            ];
+            let signer_seeds: &[&[&[u8]]] = &[staking_pool_seeds];
+    
+            let transfer_ctx = CpiContext::new_with_signer(
+                ctx.accounts.token_program.to_account_info(),
+                TransferChecked {
+                    from: ctx.accounts.pool_escrow_account.to_account_info(),
+                    to: ctx.accounts.user_token_account.to_account_info(),
+                    mint: ctx.accounts.mint.to_account_info(),
+                    authority: ctx.accounts.staking_pool.to_account_info(),
+                },
+                signer_seeds,
+            );
+    
+            // Execute the transfer of tokens (entire staked amount)
+            token_2022::transfer_checked(transfer_ctx, amount_in_base_units, mint_decimals)?;
+    
+            // Update the staking pool totals
+            let staking_pool = &mut ctx.accounts.staking_pool;
+            staking_pool.total_staked = staking_pool
+                .total_staked
+                .checked_sub(amount_in_base_units)
+                .ok_or(StakingError::MathOverflow)?;
+    
+            // NEW: Update weighted stake total
+            staking_pool.total_weighted_stake = staking_pool
+                .total_weighted_stake
+                .checked_sub(weighted_stake)
+                .ok_or(StakingError::MathOverflow)?;
+    
+            // NEW: Decrease active stakers count
+            staking_pool.active_stakers_count = staking_pool.active_stakers_count
+                .checked_sub(1)
+                .ok_or(StakingError::MathOverflow)?;
+    
+            // Reset user staking account
+            user_staking_account.staked_amount = 0;
+    
+            msg!(
+                "✅ User {} unstaked all tokens ({}). Pool totals - Staked: {}, Weighted: {}",
+                ctx.accounts.user.key(),
+                amount_in_base_units,
+                staking_pool.total_staked,
+                staking_pool.total_weighted_stake
+            );
+    
+            Ok(())
+        }
 
     // GameHub Logic (Tournament creation and registration)
     pub fn create_tournament_pool(
@@ -587,19 +668,100 @@ pub mod multiversed_dapp {
             Ok(())
         }
 
-    // Rest of the account structs and implementations remain the same...
+        impl StakingPool {
+            pub fn calculate_total_weighted_stake(&self) -> u64 {
+                self.total_weighted_stake
+            }
+        
+            pub fn get_current_event_id(&self) -> u64 {
+                self.current_event_id
+            }
+        
+            pub fn increment_event_id(&mut self) -> u64 {
+                self.current_event_id += 1;
+                self.current_event_id
+            }
+        }
+        
+        impl UserStakingAccount {
+            pub fn get_multiplier_from_lock_duration(lock_duration: i64) -> u8 {
+                match lock_duration {
+                    ONE_MONTH => MULTIPLIER_1_MONTH,
+                    THREE_MONTHS => MULTIPLIER_3_MONTHS, 
+                    SIX_MONTHS => MULTIPLIER_6_MONTHS,
+                    TWELVE_MONTHS => MULTIPLIER_12_MONTHS,
+                    _ => MULTIPLIER_1_MONTH, // Default to 1x
+                }
+            }
+        
+            pub fn get_multiplier_as_float(&self) -> f64 {
+                (self.multiplier as f64) / 10.0
+            }
+        
+            pub fn calculate_weighted_stake(&self) -> u64 {
+                let multiplier_float = self.get_multiplier_as_float();
+                (self.staked_amount as f64 * multiplier_float) as u64
+            }
+        
+            pub fn add_reward(&mut self, reward_amount: u64) {
+                self.accumulated_rewards = self.accumulated_rewards
+                    .checked_add(reward_amount)
+                    .unwrap_or(self.accumulated_rewards);
+                self.last_reward_calculation = Clock::get().unwrap().unix_timestamp;
+            }
+        }
 
 
-    #[derive(Accounts)]
-    pub struct InitializeStakingPoolAccount<'info> {
-        #[account(
-            init_if_needed,
-            payer = admin,
-            space = 8 + 32 + 32 + 8 + 8 + 8 + 8 + 1 + 8,
-            seeds = [b"staking_pool", admin.key().as_ref()],
-            bump
-        )]
-        pub staking_pool: Account<'info, StakingPool>,
+// Instructions for revenue distribution
+#[derive(Accounts)]
+#[instruction(revenue_amount: u64)]
+pub struct CreateRevenueDistributionEvent<'info> {
+    #[account(
+        init,
+        payer = admin,
+        space = 8 + 8 + 8 + 8 + 4 + 8 + 8 + 4 + (32 * 100) + 1 + 1, // Space for up to 100 participants
+        seeds = [b"revenue_event", staking_pool.key().as_ref(), &staking_pool.current_event_id.to_le_bytes()],
+        bump
+    )]
+    pub revenue_event: Account<'info, RevenueDistributionEvent>,
+
+    #[account(mut)]
+    pub staking_pool: Account<'info, StakingPool>,
+
+    #[account(mut)]
+    pub admin: Signer<'info>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+#[instruction(event_id: u64, staker_pubkey: Pubkey)]
+pub struct RecordStakerParticipation<'info> {
+    #[account(
+        init,
+        payer = admin,
+        space = 8 + 32 + 8 + 8 + 8 + 8 + 2 + 1,
+        seeds = [b"staker_participation", staker_pubkey.as_ref(), &event_id.to_le_bytes()],
+        bump
+    )]
+    pub participation: Account<'info, StakerEventParticipation>,
+
+    #[account(mut)]
+    pub admin: Signer<'info>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct InitializeStakingPoolAccount<'info> {
+    #[account(
+        init_if_needed,
+        payer = admin,
+        space = 8 + 32 + 32 + 8 + 8 + 8 + 8 + 8 + 4 + 1 + 8,
+        seeds = [b"staking_pool", admin.key().as_ref()],
+        bump
+    )]
+    pub staking_pool: Account<'info, StakingPool>,
 
         #[account(
             init_if_needed,
@@ -866,7 +1028,7 @@ pub mod multiversed_dapp {
         #[account(
             init_if_needed,
             payer = user,
-            space = 8 + 32 + 8 + 8 + 8 + 8 + 8 + 1 + 1 + 8,
+            space = 8 + 32 + 8 + 8 + 8 + 8 + 8 + 8 + 1,
             seeds = [b"user_stake", user.key().as_ref()],
             bump
         )]
@@ -924,25 +1086,30 @@ pub mod multiversed_dapp {
 
         pub token_program: Program<'info, Token2022>,
     }
-
+    // Lock period constants
     const ONE_MONTH: i64 = 30 * 24 * 60 * 60;
     const THREE_MONTHS: i64 = 3 * ONE_MONTH;
     const SIX_MONTHS: i64 = 6 * ONE_MONTH;
     const TWELVE_MONTHS: i64 = 12 * ONE_MONTH;
 
-    const APY: i8 = 0.05;
-    const MAX_STAKE: u64 = 0.25;
+    // Multiplier constants (stored as u8 for space efficiency)
+    const MULTIPLIER_1_MONTH: u8 = 10;    // 1.0x (stored as 10)
+    const MULTIPLIER_3_MONTHS: u8 = 15;   // 1.5x (stored as 15)
+    const MULTIPLIER_6_MONTHS: u8 = 20;   // 2.0x (stored as 20)
+    const MULTIPLIER_12_MONTHS: u8 = 30;  // 3.0x (stored as 30)
 
     #[account]
     pub struct StakingPool {
         pub admin: Pubkey,
         pub mint: Pubkey,
         pub total_staked: u64,
-        pub initial_revenue: u64,
-        pub incremented_revenue: u64,
-        pub total_revenue: u64,
+        pub total_weighted_stake: u64,           // NEW: Sum of all weighted stakes
+        pub current_event_id: u64,              // NEW: Current revenue distribution event ID
+        pub total_accumulated_revenue: u64,     // NEW: Total revenue ever distributed
+        pub last_distribution_timestamp: i64,   // NEW: When last revenue was distributed
+        pub active_stakers_count: u32,          // NEW: Number of active stakers
         pub bump: u8,
-        pub max_stake: u64,
+        pub max_stake: u64,                     // Keep existing field
     }
 
     #[account]
@@ -951,12 +1118,35 @@ pub mod multiversed_dapp {
         pub staked_amount: u64,
         pub stake_timestamp: i64,
         pub lock_duration: i64,
-        pub initial_reward: u64,
-        pub incremented_reward: u64,
-        pub initial_apy: i8,
-        pub incremented_apy: i8,
-        pub joined_at: i64,
+        pub joined_at_event: u64,               // NEW: Event ID when user first staked
+        pub accumulated_rewards: u64,           // NEW: Total rewards earned across all events
+        pub last_reward_calculation: i64,       // NEW: Last time rewards were calculated
+        pub multiplier: u8,                     // NEW: Lock period multiplier (10 = 1.0x, 15 = 1.5x, 20 = 2.0x)
     }
+
+    #[account]
+    pub struct RevenueDistributionEvent {
+    pub event_id: u64,                      // Unique event identifier (50, 100, 150, etc.)
+    pub revenue_amount: u64,                // Amount distributed in this event
+    pub timestamp: i64,                     // When this distribution happened
+    pub total_stakers_at_event: u32,        // Number of stakers participating
+    pub total_staked_at_event: u64,         // Total staked amount during this event
+    pub total_weighted_stake_at_event: u64, // Total weighted stake during this event
+    pub participants: Vec<Pubkey>,          // List of staker public keys who participated
+    pub is_distributed: bool,               // Whether rewards have been calculated and distributed
+    pub bump: u8,
+}
+
+#[account]
+pub struct StakerEventParticipation {
+    pub staker: Pubkey,                     // Staker's public key
+    pub event_id: u64,                      // Event they participated in
+    pub staked_amount_at_event: u64,        // Their stake during this event
+    pub weighted_stake_at_event: u64,       // Their weighted stake during this event
+    pub reward_earned: u64,                 // Reward earned from this specific event
+    pub share_percentage: u16,              // Their percentage share (basis points: 1000 = 10%)
+    pub bump: u8,
+}
 
     #[account]
     pub struct TournamentPool {
@@ -1049,19 +1239,24 @@ pub mod multiversed_dapp {
         AlreadyDistributed,
     }
 
+    // Error codes
     #[error_code]
     pub enum StakingError {
-        #[msg("Staking Pool already initialized by this admin")]
+        #[msg("Staking pool already initialized.")]
         AlreadyInitialized,
-        #[msg("Insufficient staked balance")]
-        InsufficientStakedBalance,
-        #[msg("Unauthorized access")]
-        Unauthorized,
-        #[msg("Math overflow occurred")]
-        MathOverflow,
-        #[msg("Unstaking is locked")]
-        StakeLockActive,
-        #[msg("Invalid Lock Duration, Must be 1, 3, 6 or 12 months")]
+        #[msg("Invalid lock duration. Must be 1, 3, 6, or 12 months.")]
         InvalidLockDuration,
+        #[msg("Mathematical overflow occurred.")]
+        MathOverflow,
+        #[msg("Insufficient staked amount.")]
+        InsufficientStakedAmount,
+        #[msg("Lock period has not expired.")]
+        LockPeriodNotExpired,
+        #[msg("Invalid event ID.")]
+        InvalidEventId,
+        #[msg("Event already distributed.")]
+        EventAlreadyDistributed,
+        #[msg("No stakers to distribute rewards to.")]
+        NoStakersFound,
     }
 }
