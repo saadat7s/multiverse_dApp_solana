@@ -3,7 +3,7 @@ use anchor_lang::prelude::*;
 use anchor_spl::token_2022::{self, Burn, Token2022, TransferChecked};
 use anchor_spl::token_interface::{Mint, TokenAccount};
 
-declare_id!("GSV3Qje19X3NTxc5uxhKw28uoadpZED5Siqd4tGVZ7x4");
+declare_id!("5MnmduijGED4wMJEih8MWccjJP4CrHWn5hUUkCyF4Hnf");
 
 #[program]
 pub mod multiversed_dapp {
