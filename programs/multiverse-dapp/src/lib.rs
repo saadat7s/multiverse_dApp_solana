@@ -3,7 +3,30 @@ use anchor_lang::prelude::*;
 use anchor_spl::token_2022::{self, Burn, Token2022, TransferChecked};
 use anchor_spl::token_interface::{Mint, TokenAccount};
 
-declare_id!("5MnmduijGED4wMJEih8MWccjJP4CrHWn5hUUkCyF4Hnf");
+declare_id!("HnUXpc1F7ELzb31awwM77LhQv1MhynDTJXM77298Qgbx");
+
+// ==============================
+// Global constants and helpers
+// ==============================
+// Fixed-point precision for reward accumulator
+const ACC_PRECISION: u128 = 1_000_000_000_000; // 1e12
+const BPS_DENOMINATOR: u64 = 10_000; // 100% in basis points
+
+// Lock period multipliers in basis points
+const MULTIPLIER_1M_BPS: u64 = 10_000; // 1.0x
+const MULTIPLIER_3M_BPS: u64 = 12_000; // 1.2x
+const MULTIPLIER_6M_BPS: u64 = 15_000; // 1.5xA
+const MULTIPLIER_12M_BPS: u64 = 20_000; // 2.0x
+
+fn lock_multiplier_bps(lock_duration: i64) -> u64 {
+    match lock_duration {
+        ONE_MONTH => MULTIPLIER_1M_BPS,
+        THREE_MONTHS => MULTIPLIER_3M_BPS,
+        SIX_MONTHS => MULTIPLIER_6M_BPS,
+        TWELVE_MONTHS => MULTIPLIER_12M_BPS,
+        _ => MULTIPLIER_1M_BPS,
+    }
+}
 
 #[program]
 pub mod multiversed_dapp {
@@ -176,25 +199,54 @@ pub mod multiversed_dapp {
             mint_decimals,
         )?;
 
-        // Update user staking account
+        // Update user staking account and pool weight
         let user_staking_account = &mut ctx.accounts.user_staking_account;
+        let staking_pool = &mut ctx.accounts.staking_pool;
         let _current_timestamp = Clock::get()?.unix_timestamp;
+
+        // Accrue pending before changing weight
+        let accumulated_per_user: u128 = user_staking_account
+            .weight
+            .saturating_mul(staking_pool.acc_reward_per_weight)
+            .checked_div(ACC_PRECISION)
+            .unwrap_or(0);
+        let pending_now: u128 = accumulated_per_user
+            .saturating_sub(user_staking_account.reward_debt);
+        if pending_now > 0 {
+            let add: u64 = pending_now.min(u128::from(u64::MAX)) as u64;
+            user_staking_account.pending_rewards = user_staking_account
+                .pending_rewards
+                .saturating_add(add);
+        }
+
+        // Principal and lock details
         user_staking_account.owner = ctx.accounts.user.key();
         user_staking_account.staked_amount = user_staking_account
             .staked_amount
             .checked_add(amount_in_base_units)
             .ok_or(StakingError::MathOverflow)?;
-
         user_staking_account.stake_timestamp = _current_timestamp;
         user_staking_account.lock_duration = lock_duration;
 
-        // Update total staked in pool
-        ctx.accounts.staking_pool.total_staked = ctx
-            .accounts
-            .staking_pool
+        // Pool totals and weight
+        staking_pool.total_staked = staking_pool
             .total_staked
-            .checked_add(amount_in_base_units)
-            .ok_or(StakingError::MathOverflow)?;
+            .saturating_add(amount_in_base_units);
+
+        let multiplier_bps: u64 = lock_multiplier_bps(lock_duration);
+        let added_weight: u128 = (amount_in_base_units as u128)
+            .saturating_mul(multiplier_bps as u128)
+            .checked_div(BPS_DENOMINATOR as u128)
+            .unwrap_or(0);
+        staking_pool.total_weight = staking_pool.total_weight.saturating_add(added_weight);
+        user_staking_account.weight = user_staking_account.weight.saturating_add(added_weight);
+
+        // Sync reward debt to new baseline
+        user_staking_account.reward_debt = user_staking_account
+            .weight
+            .saturating_mul(staking_pool.acc_reward_per_weight)
+            .checked_div(ACC_PRECISION)
+            .unwrap_or(0);
 
         msg!(
             "✅ {} tokens staked by user: {} for {} seconds",
@@ -209,6 +261,7 @@ pub mod multiversed_dapp {
     /// Allows users to unstake all of their tokens at any time
     pub fn unstake(ctx: Context<Unstake>) -> Result<()> {
         let user_staking_account = &mut ctx.accounts.user_staking_account;
+        let staking_pool = &mut ctx.accounts.staking_pool;
 
         // Ensure the user has a staked balance
         require!(
@@ -219,11 +272,29 @@ pub mod multiversed_dapp {
         let mint_decimals = ctx.accounts.mint.decimals;
         let amount_in_base_units = user_staking_account.staked_amount;
 
+        // Accrue pending rewards up to now
+        let accumulated_per_user: u128 = user_staking_account
+            .weight
+            .saturating_mul(staking_pool.acc_reward_per_weight)
+            .checked_div(ACC_PRECISION)
+            .unwrap_or(0);
+        let pending_now: u128 = accumulated_per_user
+            .saturating_sub(user_staking_account.reward_debt);
+        if pending_now > 0 {
+            let add: u64 = pending_now.min(u128::from(u64::MAX)) as u64;
+            user_staking_account.pending_rewards = user_staking_account
+                .pending_rewards
+                .saturating_add(add);
+        }
+
+        // Prepare signer seeds using copies to avoid conflicting borrows
+        let staking_pool_admin = staking_pool.admin;
+        let staking_pool_bump = staking_pool.bump;
         // Transfer all staked tokens from the escrow account to the user's token account
         let staking_pool_seeds = &[
             b"staking_pool",
-            ctx.accounts.staking_pool.admin.as_ref(),
-            &[ctx.accounts.staking_pool.bump],
+            staking_pool_admin.as_ref(),
+            &[staking_pool_bump],
         ];
         let signer_seeds: &[&[&[u8]]] = &[staking_pool_seeds];
 
@@ -233,7 +304,7 @@ pub mod multiversed_dapp {
                 from: ctx.accounts.pool_escrow_account.to_account_info(),
                 to: ctx.accounts.user_token_account.to_account_info(),
                 mint: ctx.accounts.mint.to_account_info(),
-                authority: ctx.accounts.staking_pool.to_account_info(),
+                authority: staking_pool.to_account_info(),
             },
             signer_seeds,
         );
@@ -247,12 +318,15 @@ pub mod multiversed_dapp {
             .checked_sub(amount_in_base_units)
             .ok_or(StakingError::MathOverflow)?;
 
-        ctx.accounts.staking_pool.total_staked = ctx
-            .accounts
-            .staking_pool
+        staking_pool.total_staked = staking_pool
             .total_staked
             .checked_sub(amount_in_base_units)
             .ok_or(StakingError::MathOverflow)?;
+
+        // Remove weight from pool and reset user's weight and debt
+        staking_pool.total_weight = staking_pool.total_weight.saturating_sub(user_staking_account.weight);
+        user_staking_account.weight = 0;
+        user_staking_account.reward_debt = 0;
 
         msg!(
             "✅ User {} unstaked all tokens. Remaining: {}",
@@ -407,6 +481,21 @@ pub mod multiversed_dapp {
         Ok(())
     }
 
+    // Initialize a global RewardPool (used to hold the 5% staking rewards)
+    pub fn initialize_reward_pool(ctx: Context<InitializeRewardPool>) -> Result<()> {
+        let reward_pool = &mut ctx.accounts.reward_pool;
+        let admin = &ctx.accounts.admin;
+
+        reward_pool.admin = admin.key();
+        reward_pool.mint = ctx.accounts.mint.key();
+        reward_pool.total_funds = 0;
+        reward_pool.last_distribution = Clock::get()?.unix_timestamp;
+        reward_pool.bump = ctx.bumps.reward_pool;
+
+        msg!("✅ Reward pool initialized for admin: {}", admin.key());
+        Ok(())
+    }
+
     // New instruction to initialize a prize pool for a specific tournament
     pub fn initialize_prize_pool(
         ctx: Context<InitializePrizePool>,
@@ -532,24 +621,35 @@ pub mod multiversed_dapp {
                 .saturating_add(revenue_amount);
         }
 
-        // Transfer to staking pool (optimized)
+        // Transfer staking rewards portion to RewardPool (NOT staking pool)
         if staking_amount > 0 {
             token_2022::transfer_checked(
                 CpiContext::new(
                     ctx.accounts.token_program.to_account_info(),
                     TransferChecked {
                         from: ctx.accounts.tournament_escrow_account.to_account_info(),
-                        to: ctx.accounts.staking_escrow_account.to_account_info(),
+                        to: ctx.accounts.reward_escrow_account.to_account_info(),
                         mint: mint.to_account_info(),
-                        authority: ctx.accounts.admin.to_account_info(), // Use admin as authority
+                        authority: ctx.accounts.admin.to_account_info(),
                     },
                 ),
                 staking_amount,
                 decimals,
             )?;
-            
-            ctx.accounts.staking_pool.total_staked = ctx.accounts.staking_pool.total_staked
+
+            ctx.accounts.reward_pool.total_funds = ctx.accounts.reward_pool.total_funds
                 .saturating_add(staking_amount);
+
+            // Update reward accumulator for current stakers
+            let sp = &mut ctx.accounts.staking_pool;
+            if sp.total_weight > 0 {
+                let delta: u128 = (staking_amount as u128)
+                    .saturating_mul(ACC_PRECISION)
+                    .checked_div(sp.total_weight)
+                    .unwrap_or(0);
+                sp.acc_reward_per_weight = sp.acc_reward_per_weight.saturating_add(delta);
+                sp.epoch_index = sp.epoch_index.saturating_add(1);
+            }
         }
 
         // Burn tokens (optimized)
@@ -580,6 +680,57 @@ pub mod multiversed_dapp {
             burn_amount
         );
 
+        Ok(())
+    }
+
+    /// Claim rewards from RewardPool pro‑rata to user weight
+    pub fn claim_rewards(ctx: Context<ClaimRewards>) -> Result<()> {
+        let staking_pool = &mut ctx.accounts.staking_pool;
+        let reward_pool = &mut ctx.accounts.reward_pool;
+        let user_staking_account = &mut ctx.accounts.user_staking_account;
+
+        // Compute claimable based on accumulator
+        let accumulated: u128 = user_staking_account
+            .weight
+            .saturating_mul(staking_pool.acc_reward_per_weight)
+            .checked_div(ACC_PRECISION)
+            .unwrap_or(0);
+        let claimable_u128: u128 = accumulated.saturating_sub(user_staking_account.reward_debt)
+            .saturating_add(user_staking_account.pending_rewards as u128);
+        let claimable: u64 = claimable_u128.min(u128::from(u64::MAX)) as u64;
+        require!(claimable > 0, StakingError::InsufficientStakedBalance); // nothing to claim
+
+        // Ensure RewardPool has sufficient funds
+        require!(reward_pool.total_funds >= claimable, TournamentError::InsufficientFunds);
+
+        // Transfer from reward escrow to user token account
+        let decimals = ctx.accounts.mint.decimals;
+        let reward_admin = reward_pool.admin;
+        let reward_bump = reward_pool.bump;
+        let reward_pool_seeds = &[b"reward_pool", reward_admin.as_ref(), &[reward_bump]];
+        let signer_seeds: &[&[&[u8]]] = &[reward_pool_seeds];
+        let transfer_ctx = CpiContext::new_with_signer(
+            ctx.accounts.token_program.to_account_info(),
+            TransferChecked {
+                from: ctx.accounts.reward_escrow_account.to_account_info(),
+                to: ctx.accounts.user_token_account.to_account_info(),
+                mint: ctx.accounts.mint.to_account_info(),
+                authority: reward_pool.to_account_info(),
+            },
+            signer_seeds,
+        );
+        token_2022::transfer_checked(transfer_ctx, claimable, decimals)?;
+
+        // Update accounting
+        reward_pool.total_funds = reward_pool.total_funds.saturating_sub(claimable);
+        user_staking_account.pending_rewards = 0;
+        user_staking_account.reward_debt = user_staking_account
+            .weight
+            .saturating_mul(staking_pool.acc_reward_per_weight)
+            .checked_div(ACC_PRECISION)
+            .unwrap_or(0);
+
+        msg!("✅ Rewards claimed: {}", claimable);
         Ok(())
     }
 
@@ -724,6 +875,34 @@ pub mod multiversed_dapp {
     }
 
     #[derive(Accounts)]
+    pub struct InitializeRewardPool<'info> {
+        #[account(
+            init,
+            payer = admin,
+            space = 8 + 32 + 32 + 8 + 8 + 1,
+            seeds = [b"reward_pool", admin.key().as_ref()],
+            bump
+        )]
+        pub reward_pool: Account<'info, RewardPool>,
+
+        #[account(
+            init,
+            payer = admin,
+            token::mint = mint,
+            token::authority = reward_pool,
+            seeds = [b"reward_escrow", reward_pool.key().as_ref()],
+            bump
+        )]
+        pub reward_escrow_account: InterfaceAccount<'info, TokenAccount>,
+
+        pub mint: InterfaceAccount<'info, Mint>,
+        #[account(mut)]
+        pub admin: Signer<'info>,
+        pub system_program: Program<'info, System>,
+        pub token_program: Program<'info, Token2022>,
+    }
+
+    #[derive(Accounts)]
     #[instruction(tournament_id: String)]
     pub struct InitializePrizePool<'info> {
         #[account(
@@ -796,6 +975,13 @@ pub mod multiversed_dapp {
         )]
         pub staking_pool: Account<'info, StakingPool>,
 
+        #[account(
+            mut,
+            seeds = [b"reward_pool", admin.key().as_ref()],
+            bump = reward_pool.bump
+        )]
+        pub reward_pool: Account<'info, RewardPool>,
+
         // CRITICAL FIX: Removed explicit authority constraints to reduce validation overhead
         #[account(mut)]
         pub tournament_escrow_account: InterfaceAccount<'info, TokenAccount>,
@@ -807,7 +993,7 @@ pub mod multiversed_dapp {
         pub revenue_escrow_account: InterfaceAccount<'info, TokenAccount>,
 
         #[account(mut)]
-        pub staking_escrow_account: InterfaceAccount<'info, TokenAccount>,
+        pub reward_escrow_account: InterfaceAccount<'info, TokenAccount>,
 
         #[account(mut)]
         pub mint: InterfaceAccount<'info, Mint>,
@@ -820,7 +1006,8 @@ pub mod multiversed_dapp {
         #[account(
             init_if_needed,
             payer = admin,
-            space = 8 + 32 + 32 + 8 + 1,
+            // admin + mint + total_staked(u64) + total_weight(u128) + acc_reward_per_weight(u128) + epoch_index(u64) + bump
+            space = 8 + 32 + 32 + 8 + 16 + 16 + 8 + 1,
             seeds = [b"staking_pool", admin.key().as_ref()],
             bump
         )]
@@ -858,7 +1045,8 @@ pub mod multiversed_dapp {
         #[account(
             init_if_needed,
             payer = user,
-            space = 8 + 32 + 8 + 8 + 8,
+            // owner + staked_amount(u64) + stake_timestamp(i64) + lock_duration(i64) + weight(u128) + reward_debt(u128) + pending_rewards(u64)
+            space = 8 + 32 + 8 + 8 + 8 + 16 + 16 + 8,
             seeds = [b"user_stake", user.key().as_ref()],
             bump
         )]
@@ -917,6 +1105,48 @@ pub mod multiversed_dapp {
         pub token_program: Program<'info, Token2022>,
     }
 
+    // Accounts for claiming rewards
+    #[derive(Accounts)]
+    pub struct ClaimRewards<'info> {
+        #[account(mut)]
+        pub user: Signer<'info>,
+
+        #[account(
+            mut,
+            seeds = [b"staking_pool", staking_pool.admin.as_ref()],
+            bump = staking_pool.bump
+        )]
+        pub staking_pool: Account<'info, StakingPool>,
+
+        #[account(
+            mut,
+            seeds = [b"user_stake", user.key().as_ref()],
+            bump
+        )]
+        pub user_staking_account: Account<'info, UserStakingAccount>,
+
+        #[account(
+            mut,
+            seeds = [b"reward_pool", reward_pool.admin.as_ref()],
+            bump = reward_pool.bump
+        )]
+        pub reward_pool: Account<'info, RewardPool>,
+
+        #[account(mut)]
+        pub user_token_account: InterfaceAccount<'info, TokenAccount>,
+
+        #[account(
+            mut,
+            token::mint = mint,
+            token::authority = reward_pool
+        )]
+        pub reward_escrow_account: InterfaceAccount<'info, TokenAccount>,
+
+        #[account(mut, constraint = mint.key() == staking_pool.mint)]
+        pub mint: InterfaceAccount<'info, Mint>,
+        pub token_program: Program<'info, Token2022>,
+    }
+
     const ONE_MONTH: i64 = 30 * 24 * 60 * 60;
     const THREE_MONTHS: i64 = 3 * ONE_MONTH;
     const SIX_MONTHS: i64 = 6 * ONE_MONTH;
@@ -927,6 +1157,9 @@ pub mod multiversed_dapp {
         pub admin: Pubkey,
         pub mint: Pubkey,
         pub total_staked: u64,
+        pub total_weight: u128,
+        pub acc_reward_per_weight: u128,
+        pub epoch_index: u64,
         pub bump: u8,
     }
 
@@ -936,6 +1169,9 @@ pub mod multiversed_dapp {
         pub staked_amount: u64,
         pub stake_timestamp: i64,
         pub lock_duration: i64,
+        pub weight: u128,
+        pub reward_debt: u128,
+        pub pending_rewards: u64,
     }
 
     #[account]
@@ -974,6 +1210,16 @@ pub mod multiversed_dapp {
 
     #[account]
     pub struct RevenuePool {
+        pub admin: Pubkey,
+        pub mint: Pubkey,
+        pub total_funds: u64,
+        pub last_distribution: i64,
+        pub bump: u8,
+    }
+
+    // Dedicated Reward Pool for staking rewards (5%)
+    #[account]
+    pub struct RewardPool {
         pub admin: Pubkey,
         pub mint: Pubkey,
         pub total_funds: u64,
